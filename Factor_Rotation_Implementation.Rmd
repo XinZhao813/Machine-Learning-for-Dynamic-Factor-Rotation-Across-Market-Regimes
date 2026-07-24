@@ -1,0 +1,549 @@
+---
+title: 'ML factor rotation research report R code '
+output: pdf_document
+---
+
+# 1: Data Collection
+```{r, warning=FALSE}
+# 1.0 Install & Load Packages
+# install.packages(c("frenchdata", "quantmod", "tidyverse", "readxl", "lubridate"))
+
+library(frenchdata)
+library(quantmod)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+
+# 1.1 Fama-French 6 Factor Data
+# Source: Kenneth French Data Library (via frenchdata package)
+
+ff6 <- download_french_data("Fama/French 5 Factors (2x3)")
+ff_mom <- download_french_data("Momentum Factor (Mom)")
+
+# Extract monthly data
+ff6_monthly <- ff6$subsets$data[[1]] %>%
+  mutate(date = as.Date(paste0(date, "01"), format = "%Y%m%d")) %>%
+  rename(MKT = `Mkt-RF`) %>%
+  select(date, MKT, SMB, HML, RMW, CMA, RF)
+
+mom_monthly <- ff_mom$subsets$data[[1]] %>%
+  mutate(date = as.Date(paste0(date, "01"), format = "%Y%m%d")) %>%
+  rename(MOM = Mom) %>%
+  select(date, MOM)
+
+# Merge FF factors
+ff_data <- ff6_monthly %>%
+  left_join(mom_monthly, by = "date") %>%
+  filter(date >= as.Date("1990-01-01"),
+         date <= as.Date("2023-12-01")) %>%
+  mutate(across(c(MKT, SMB, HML, RMW, CMA, MOM, RF), ~ . / 100))
+
+cat("FF Data:", nrow(ff_data), "monthly observations\n")
+
+
+# 1.2 Goyal-Welch Macroeconomic Predictors
+# Download Data2024.xlsx from Amit Goyal's website https://sites.google.com/view/agoyal145
+# https://docs.google.com/spreadsheets/d/10_nkOkJPvq4eZgNl-1ys63PzhbnM3S2y/edit?usp=
+# sharing&ouid=113571510202500088860&rtpof=true&sd=true
+
+gw_raw <- read_excel("/Users/vitozhao/Downloads/Data2024.xlsx", sheet = "Monthly")
+
+gw_data <- gw_raw %>%
+  mutate(date = as.Date(paste0(yyyymm, "01"), format = "%Y%m%d")) %>%
+  select(date,
+         dp   = `d/p`,  # Dividend-price ratio
+         ep   = `e/p`,  # Earnings-price ratio
+         bm   = `b/m`,  # Book-to-market ratio
+         tbl,           # T-bill rate
+         lty,           # Long-term yield
+         tms,           # Term spread
+         dfy,           # Default yield spread
+         dfr,           # Default return spread
+         infl,          # Inflation
+         ltr,           # Long-term return
+         svar           # Stock variance
+  ) %>%
+  filter(date >= as.Date("1990-01-01"),
+         date <= as.Date("2023-12-01"))
+
+cat("GW Data:", nrow(gw_data), "monthly observations\n")
+
+
+# 1.3 VIX Data for Regime Classification
+# Source: Yahoo Finance via quantmod
+
+getSymbols("^VIX", src = "yahoo",
+           from = "1990-01-01",
+           to   = "2023-12-31",
+           auto.assign = TRUE)
+
+vix_xts <- to.monthly(VIX, indexAt = "firstof")
+vix_monthly <- data.frame(
+  date = as.Date(index(vix_xts)),
+  VIX  = as.numeric(Cl(vix_xts))
+) %>%
+  filter(!is.na(VIX),
+         date >= as.Date("1990-01-01"),
+         date <= as.Date("2023-12-01"))
+
+cat("VIX Data:", nrow(vix_monthly), "monthly observations\n")
+
+
+# 1.4 Merge All Data
+
+master_data <- ff_data %>%
+  left_join(gw_data, by = "date") %>%
+  left_join(vix_monthly, by = "date") %>%
+  arrange(date)
+
+cat("\nMissing values per column:\n")
+print(colSums(is.na(master_data)))
+
+cat("\nFinal dataset:", nrow(master_data), "rows,",
+    ncol(master_data), "columns\n")
+cat("Period:", as.character(min(master_data$date)),
+    "to", as.character(max(master_data$date)), "\n")
+```
+
+
+# 2: Data Preprocessing
+```{r, warning=FALSE}
+# 2.1 Use Lag Predictors by 1 Month to avoid look-ahead bias
+# X at time t predicts Y at time t+1
+
+predictors <- c("dp", "ep", "bm", "tbl", "lty", "tms",
+                "dfy", "dfr", "infl", "ltr", "svar")
+
+factors <- c("MKT", "SMB", "HML", "RMW", "CMA", "MOM")
+
+model_data <- master_data %>%
+  mutate(across(all_of(predictors), ~ lag(., 1))) %>%
+  filter(!is.na(dp))  # remove first row lost due to lagging
+
+cat("After lagging predictors:", nrow(model_data), "rows\n")
+
+
+# 2.2 Winsorize Predictors at 1% / 99% to handle outliers
+
+winsorize <- function(x, lower = 0.01, upper = 0.99) {
+  q <- quantile(x, probs = c(lower, upper), na.rm = TRUE)
+  pmax(pmin(x, q[2]), q[1])
+}
+
+model_data <- model_data %>%
+  mutate(across(all_of(predictors), winsorize))
+
+
+# 2.3 Standardize Predictors
+
+model_data <- model_data %>%
+  mutate(across(all_of(predictors), ~ scale(.)[, 1]))
+
+
+# 2.4 Regime Classification using VIX
+# Low volatility:  VIX <= median
+# High volatility: VIX >  median
+
+vix_median <- median(model_data$VIX, na.rm = TRUE)
+cat("VIX median threshold:", round(vix_median, 2), "\n")
+
+model_data <- model_data %>%
+  mutate(regime = ifelse(VIX <= vix_median, "low_vol", "high_vol"),
+         regime = factor(regime, levels = c("low_vol", "high_vol")))
+
+cat("\nRegime distribution:\n")
+print(table(model_data$regime))
+
+# 2.5 Summary Check
+
+cat("\nFinal model_data:", nrow(model_data), "rows,",
+    ncol(model_data), "columns\n")
+cat("Missing values:\n")
+print(colSums(is.na(model_data)))
+```
+
+
+# 3: Model Definitions
+```{r, warning=FALSE}
+# install.packages(c("glmnet", "randomForest", "nnet"))
+library(glmnet)
+library(randomForest)
+library(nnet)
+
+# LASSO
+fit_lasso <- function(X_train, y_train, X_test) {
+  cv_fit <- cv.glmnet(X_train, y_train, alpha = 1, nfolds = 5)
+  predict(cv_fit, newx = X_test, s = "lambda.min")[1]
+}
+
+# Random Forest
+fit_rf <- function(X_train, y_train, X_test) {
+  model <- randomForest(x = X_train, y = y_train,
+                        ntree = 200, mtry = 4)
+  predict(model, newdata = X_test)
+}
+
+# Neural Network (MLP)
+fit_nn <- function(X_train, y_train, X_test) {
+  model <- nnet(x = X_train, y = y_train,
+                size = 5, linout = TRUE,
+                decay = 0.01, maxit = 200,
+                trace = FALSE)
+  predict(model, newdata = X_test)[1]
+}
+```
+
+
+# 4: Rolling Window Prediction
+```{r, warning=FALSE}
+# 4.0 Setup
+set.seed(423)
+train_window <- 60        # 60 months training window
+n <- nrow(model_data)
+dates <- model_data$date
+
+# Empty matrices to store predictions (rows = time, cols = factors)
+pred_lasso <- matrix(NA, nrow = n, ncol = length(factors),
+                     dimnames = list(NULL, factors))
+pred_rf <- matrix(NA, nrow = n, ncol = length(factors),
+                  dimnames = list(NULL, factors))
+pred_nn <- matrix(NA, nrow = n, ncol = length(factors),
+                  dimnames = list(NULL, factors))
+
+# 4.1 Rolling Window Loop
+cat("Running rolling window predictions...\n")
+
+for (t in (train_window + 1):n) {
+
+  train_idx <- (t - train_window):(t - 1)
+
+  X_train <- as.matrix(model_data[train_idx, predictors])
+  X_test <- as.matrix(model_data[t, predictors])
+
+  for (fac in factors) {
+    y_train <- model_data[[fac]][train_idx]
+
+    pred_lasso[t, fac] <- fit_lasso(X_train, y_train, X_test)
+    pred_rf[t, fac] <- fit_rf(X_train, y_train, X_test)
+    pred_nn[t, fac] <- fit_nn(X_train, y_train, X_test)
+  }
+
+  if (t %% 12 == 0) cat("Done:", as.character(dates[t]), "\n")
+}
+
+# 4.2 Collect results into one data frame
+results <- model_data %>%
+  select(date, regime, all_of(factors)) %>%
+  rename_with(~ paste0("actual_", .), all_of(factors)) %>%
+  bind_cols(
+    as.data.frame(pred_lasso) %>% rename_with(~ paste0("lasso_", .)),
+    as.data.frame(pred_rf) %>% rename_with(~ paste0("rf_", .)),
+    as.data.frame(pred_nn) %>% rename_with(~ paste0("nn_", .))
+  ) %>%
+  slice((train_window + 1):n)   # keep only out-of-sample rows
+
+cat("Out-of-sample predictions stored:", nrow(results), "rows\n")
+```
+
+
+# 5: Evaluation Matrices
+```{r,warning=FALSE}
+# 5.1 Out-of-Sample R² function
+
+oos_r2 <- function(actual, predicted) {
+  benchmark <- mean(actual, na.rm = TRUE)
+  mse_model <- mean((actual - predicted)^2, na.rm = TRUE)
+  mse_benchmark <- mean((actual - benchmark)^2, na.rm = TRUE)
+  1 - mse_model / mse_benchmark
+}
+
+# 5.2 Compute R²_oos for each model × factor × regime
+
+models <- c("lasso", "rf", "nn")
+regimes <- c("full", "low_vol", "high_vol")
+
+r2_results <- expand.grid(model = models,
+                          factor = factors,
+                          regime = regimes,
+                          stringsAsFactors = FALSE) %>%
+  mutate(r2_oos = NA_real_)
+
+for (i in seq_len(nrow(r2_results))) {
+  mod <- r2_results$model[i]
+  fac <- r2_results$factor[i]
+  reg <- r2_results$regime[i]
+
+  if (reg == "full") {
+    sub <- results
+  } else {
+    sub <- results %>% filter(regime == reg)
+  }
+
+  actual <- sub[[paste0("actual_", fac)]]
+  predicted <- sub[[paste0(mod, "_", fac)]]
+
+  r2_results$r2_oos[i] <- oos_r2(actual, predicted)
+}
+
+cat("\nOut-of-Sample R² by Model and Factor\n")
+r2_wide <- r2_results %>%
+  filter(regime == "full") %>%
+  select(model, factor, r2_oos) %>%
+  pivot_wider(names_from = factor, values_from = r2_oos) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+print(r2_wide)
+
+cat("\nR²_oos by Regime\n")
+r2_regime <- r2_results %>%
+  filter(regime != "full") %>%
+  group_by(model, regime) %>%
+  summarise(avg_r2 = round(mean(r2_oos), 4), .groups = "drop")
+print(r2_regime)
+
+# 5.3 Sharpe Ratio of Long-Short Factor Rotation Strategy
+# Each month: go long the factor with highest predicted return,
+#             short the factor with lowest predicted return
+
+sharpe <- function(returns) {
+  mean(returns, na.rm = TRUE) / sd(returns, na.rm = TRUE) * sqrt(12)
+}
+
+strategy_returns <- data.frame(date = results$date, regime = results$regime)
+
+for (mod in models) {
+  pred_cols <- paste0(mod, "_", factors)
+  strat_returns <- numeric(nrow(results))
+  for (j in seq_len(nrow(results))) {
+    preds <- as.numeric(results[j, pred_cols])
+    long_ret <- results[j, paste0("actual_", factors[which.max(preds)])]
+    short_ret <- results[j, paste0("actual_", factors[which.min(preds)])]
+    strat_returns[j] <- as.numeric(long_ret) - as.numeric(short_ret)
+  }
+  
+  strategy_returns[[mod]] <- strat_returns
+
+  cat("\nSharpe Ratio -", toupper(mod), "strategy:", round(sharpe(strat_returns), 3))
+  cat("(low_vol:", round(sharpe(strat_returns[results$regime == "low_vol"]), 3), ")")
+  cat("(high_vol:", round(sharpe(strat_returns[results$regime == "high_vol"]), 3), ")\n")
+}
+
+# 5.4 Hit Ratio
+# Proportion of months where predicted direction matches actual direction
+
+hit_ratio <- function(actual, predicted) {
+  correct <- sign(actual) == sign(predicted)
+  mean(correct, na.rm = TRUE)
+}
+
+hit_results <- expand.grid(model  = models,
+                           factor = factors,
+                           regime = regimes,
+                           stringsAsFactors = FALSE) %>%
+  mutate(hit = NA_real_)
+
+for (i in seq_len(nrow(hit_results))) {
+  mod <- hit_results$model[i]
+  fac <- hit_results$factor[i]
+  reg <- hit_results$regime[i]
+
+  if (reg == "full") {
+    sub <- results
+  } else {
+    sub <- results %>% filter(regime == reg)
+  }
+
+  actual <- sub[[paste0("actual_", fac)]]
+  predicted <- sub[[paste0(mod, "_", fac)]]
+
+  hit_results$hit[i] <- hit_ratio(actual, predicted)
+}
+
+cat("\nHit Ratio by Model and Factor (Full Sample)\n")
+hit_wide <- hit_results %>%
+  filter(regime == "full") %>%
+  select(model, factor, hit) %>%
+  pivot_wider(names_from = factor, values_from = hit) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+print(hit_wide)
+
+cat("\nAverage Hit Ratio by Model and Regime\n")
+hit_regime <- hit_results %>%
+  filter(regime != "full") %>%
+  group_by(model, regime) %>%
+  summarise(avg_hit = round(mean(hit), 4), .groups = "drop")
+print(hit_regime)
+```
+
+
+# 6: Plots
+```{r,warning=FALSE}
+# 6.1 Cumulative Returns of Long-Short Strategy by Model
+# Build strategy return series for each model
+
+# Cumulative returns
+cum_returns <- strategy_returns %>%
+  mutate(across(all_of(models), ~ cumsum(.))) %>%
+  pivot_longer(cols = all_of(models), names_to = "model", values_to = "cum_return") %>%
+  mutate(model = toupper(model))
+
+regime_bands <- results %>%
+  mutate(xmin = date,
+         xmax = lead(date, default = last(date)),
+         fill_color = ifelse(regime == "high_vol", "High Volatility", "Low Volatility"))
+
+p1 <- ggplot(cum_returns, aes(x = date, y = cum_return, color = model)) +
+  geom_rect(data = regime_bands,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill_color),
+            inherit.aes = FALSE, alpha = 0.15) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Cumulative Returns of Long-Short Factor Rotation Strategy",
+       x = NULL, y = "Cumulative Return", color = "Model", fill = "Regime") +
+  theme_minimal() +
+  scale_color_manual(values = c("LASSO" = "blue3",
+                                "RF" = "green3",
+                                "NN" = "coral")) +
+  scale_fill_manual(values = c("Low Volatility"  = "green",
+                               "High Volatility" = "red")) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               limits = c(min(results$date), max(results$date)))
+print(p1)
+
+# 6.2 Rolling 12-Month Sharpe Ratio by Model over Time
+
+roll_window <- 12
+
+rolling_sharpe <- data.frame(date = results$date)
+
+for (mod in models) {
+  ret <- strategy_returns[[mod]]
+  rs  <- numeric(length(ret))
+  for (j in seq_along(ret)) {
+    if (j < roll_window) {
+      rs[j] <- NA
+    } else {
+      window_ret <- ret[(j - roll_window + 1):j]
+      rs[j] <- mean(window_ret) / sd(window_ret) * sqrt(12)
+    }
+  }
+  rolling_sharpe[[toupper(mod)]] <- rs
+}
+
+rolling_sharpe_long <- rolling_sharpe %>%
+  pivot_longer(cols = toupper(models), names_to = "model", values_to = "sharpe") %>%
+  left_join(results %>% select(date, regime), by = "date") %>%
+  filter(!is.na(sharpe))
+
+
+p2 <- ggplot(rolling_sharpe_long, aes(x = date, y = sharpe, color = model)) +
+  geom_rect(data = regime_bands,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill_color),
+            inherit.aes = FALSE, alpha = 0.15) +
+  geom_line(linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Rolling 12-Month Sharpe Ratio by Model",
+       x = NULL, y = "Annualized Sharpe Ratio",
+       color = "Model", fill = "Regime") +
+  theme_minimal() +
+  scale_color_manual(values = c("LASSO" = "blue3",
+                                "RF" = "green3",
+                                "NN" = "coral")) +
+  scale_fill_manual(values = c("Low Volatility"  = "green",
+                               "High Volatility" = "red")) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               limits = c(min(results$date), max(results$date)))
+print(p2)
+
+# 6.3 Rolling 12-Month Hit Ratio by Model over Time
+
+rolling_hit <- data.frame(date = results$date)
+
+for (mod in models) {
+  rh <- numeric(nrow(results))
+  for (j in seq_len(nrow(results))) {
+    if (j < roll_window) {
+      rh[j] <- NA
+    } else {
+      window_idx <- (j - roll_window + 1):j
+      # Compute hit ratio per factor first, then average across factors
+      hit_per_factor <- sapply(factors, function(f) {
+        actual <- results[[paste0("actual_", f)]][window_idx]
+        predicted <- results[[paste0(mod, "_", f)]][window_idx]
+        mean(sign(actual) == sign(predicted), na.rm = TRUE)
+      })
+      rh[j] <- mean(hit_per_factor, na.rm = TRUE)
+    }
+  }
+  rolling_hit[[toupper(mod)]] <- rh
+}
+
+rolling_hit_long <- rolling_hit %>%
+  pivot_longer(cols = toupper(models), names_to = "model", values_to = "hit") %>%
+  left_join(results %>% select(date, regime), by = "date") %>%
+  filter(!is.na(hit))
+
+p3 <- ggplot(rolling_hit_long, aes(x = date, y = hit, color = model)) +
+  geom_rect(data = regime_bands,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill_color),
+            inherit.aes = FALSE, alpha = 0.15) +
+  geom_line(linewidth = 0.7) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "black") +
+  labs(title = "Rolling 12-Month Hit Ratio by Model",
+       subtitle = "Dashed = 0.5 random benchmark",
+       x = NULL, y = "Hit Ratio", color = "Model", fill = "Regime") +
+  theme_minimal() +
+  scale_color_manual(values = c("LASSO" = "blue3",
+                                "RF" = "green3",
+                                "NN" = "coral")) +
+  scale_fill_manual(values = c("Low Volatility"  = "green",
+                               "High Volatility" = "red")) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               limits = c(min(results$date), max(results$date)))
+print(p3)
+
+# 6.4 Rolling 12-Month Out-of-Sample R² by Model over Time
+
+rolling_r2 <- data.frame(date = results$date)
+
+for (mod in models) {
+  rr <- numeric(nrow(results))
+  for (j in seq_len(nrow(results))) {
+    if (j < roll_window) {
+      rr[j] <- NA
+    } else {
+      window_idx <- (j - roll_window + 1):j
+      r2_vals <- sapply(factors, function(f) {
+        actual <- results[[paste0("actual_", f)]][window_idx]
+        predicted <- results[[paste0(mod, "_", f)]][window_idx]
+        benchmark <- mean(actual, na.rm = TRUE)
+        1 - mean((actual - predicted)^2) / mean((actual - benchmark)^2)
+      })
+      rr[j] <- mean(r2_vals, na.rm = TRUE)
+    }
+  }
+  rolling_r2[[toupper(mod)]] <- rr
+}
+
+rolling_r2_long <- rolling_r2 %>%
+  pivot_longer(cols = toupper(models), names_to = "model", values_to = "r2") %>%
+  filter(!is.na(r2))
+
+p4 <- ggplot(rolling_r2_long, aes(x = date, y = r2, color = model)) +
+  geom_rect(data = regime_bands,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill_color),
+            inherit.aes = FALSE, alpha = 0.15) +
+  geom_line(linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Rolling 12-Month Out-of-Sample R² by Model",
+       subtitle = "Dashed = historical mean benchmark",
+       x = NULL, y = "Average R²_oos (across factors)", color = "Model", fill = "Regime") +
+  theme_minimal() +
+  scale_color_manual(values = c("LASSO" = "blue3",
+                                "RF" = "green3",
+                                "NN" = "coral")) +
+  scale_fill_manual(values = c("Low Volatility"  = "green",
+                               "High Volatility" = "red")) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               limits = c(min(results$date), max(results$date))) +
+  coord_cartesian(ylim = c(-5, 0.1))
+print(p4)
+```
