@@ -2,9 +2,9 @@
 
 ## Overview
 
-This project investigates whether machine learning models can predict future factor returns and improve systematic portfolio allocation.
+This project investigates whether machine learning models can extract predictive signals from macroeconomic variables and improve systematic factor allocation.
 
-The project combines Fama-French factor models, macroeconomic predictors, and machine learning techniques to develop a dynamic factor rotation strategy across different market regimes.
+The project combines Fama-French six-factor models, macroeconomic predictors, and machine learning techniques to evaluate factor return predictability and construct a dynamic factor rotation strategy across different market regimes.
 
 ---
 
